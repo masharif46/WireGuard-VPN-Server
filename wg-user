@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Installed by setup-wireguard.sh
+set -Eeuo pipefail
+umask 077
+
+WG_IF="${WG_IF:-wg0}"
+WG_DIR="${WG_DIR:-/etc/wireguard}"
+WG_CONF="${WG_DIR}/${WG_IF}.conf"
+WG_ENV="${WG_DIR}/${WG_IF}.env"
+CLIENT_DIR="${WG_DIR}/clients"
+VPN_PREFIX="10.8.0"
+LOCK_FILE="${WG_LOCK_FILE:-/run/lock/wg-user.lock}"
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+if [[ "${EUID}" -ne 0 ]]; then
+    die "Run as root: sudo wg-user <add|remove|list|show|qr> [name]"
+fi
+
+[[ -f "${WG_CONF}" ]] || die "Missing ${WG_CONF}. Run the server installer first."
+mkdir -p "${CLIENT_DIR}"
+chmod 700 "${CLIENT_DIR}"
+
+valid_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_endpoint() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9.-]+:[0-9]{1,5}$ ]]
+}
+
+valid_ipv4() {
+    local octet
+    local -a octets
+    [[ "${1:-}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+    IFS='.' read -r -a octets <<< "${1}"
+    for octet in "${octets[@]}"; do
+        (( 10#${octet} <= 255 )) || return 1
+    done
+}
+
+read_endpoint() {
+    [[ -f "${WG_ENV}" ]] || die "Missing ${WG_ENV}. Reinstall or set the server endpoint there."
+    SERVER_ENDPOINT="$(awk -F= '$1 == "SERVER_ENDPOINT" {print substr($0, index($0, "=") + 1); exit}' "${WG_ENV}")"
+    CLIENT_DNS="$(awk -F= '$1 == "CLIENT_DNS" {print substr($0, index($0, "=") + 1); exit}' "${WG_ENV}")"
+    valid_endpoint "${SERVER_ENDPOINT}" || die "Invalid SERVER_ENDPOINT in ${WG_ENV}."
+    valid_ipv4 "${CLIENT_DNS}" || die "Invalid CLIENT_DNS in ${WG_ENV}."
+}
+
+next_ip() {
+    local last_octet ip
+    for last_octet in $(seq 2 254); do
+        ip="${VPN_PREFIX}.${last_octet}"
+        if ! grep -Fq -- "AllowedIPs = ${ip}/32" "${WG_CONF}"; then
+            printf '%s\n' "${ip}"
+            return 0
+        fi
+    done
+    die "No free VPN addresses remain in ${VPN_PREFIX}.0/24."
+}
+
+peer_key_for() {
+    local name="$1"
+    awk -v n="${name}" '
+        $0 == "# BEGIN_PEER " n { inside=1; next }
+        $0 == "# END_PEER " n { inside=0 }
+        inside && $1 == "PublicKey" { print $3; exit }
+    ' "${WG_CONF}"
+}
+
+list_clients() {
+    local file name address found=0
+    printf 'WireGuard clients:\n\n'
+    for file in "${CLIENT_DIR}"/*.conf; do
+        [[ -e "${file}" ]] || continue
+        name="$(basename -- "${file}" .conf)"
+        address="$(awk -F ' *= *' '$1 == "Address" {print $2; exit}' "${file}")"
+        printf '%-20s %s\n' "${name}" "${address:-unknown}"
+        found=1
+    done
+    (( found == 1 )) || printf 'No clients.\n'
+}
+
+show_or_qr() {
+    local action="$1" name="$2" conf="${CLIENT_DIR}/${2}.conf"
+    valid_name "${name}" || die "Invalid client name. Use letters, numbers, underscore, or hyphen."
+    [[ -f "${conf}" ]] || die "Client not found: ${name}"
+    if [[ "${action}" == show ]]; then
+        cat -- "${conf}"
+    else
+        command -v qrencode >/dev/null 2>&1 || die "Install qrencode to display QR codes (Ubuntu: apt install qrencode; Rocky: dnf install qrencode)."
+        qrencode -t ansiutf8 < "${conf}"
+    fi
+}
+
+add_client() {
+    local name="${1:-}" client_ip client_private client_public psk server_public
+    local client_conf tmp_client tmp_server tmp_backup
+
+    valid_name "${name}" || die "Usage: wg-user add NAME (letters, numbers, underscore, or hyphen only)"
+    client_conf="${CLIENT_DIR}/${name}.conf"
+    [[ ! -e "${client_conf}" ]] || die "Client already exists: ${name}"
+    [[ -z "$(peer_key_for "${name}")" ]] || die "A server peer block already exists for: ${name}"
+    read_endpoint
+    wg show "${WG_IF}" >/dev/null 2>&1 || die "WireGuard interface ${WG_IF} is not running."
+
+    client_ip="$(next_ip)"
+    client_private="$(wg genkey)"
+    client_public="$(printf '%s' "${client_private}" | wg pubkey)"
+    psk="$(wg genpsk)"
+    server_public="$(wg show "${WG_IF}" public-key)"
+
+    tmp_client="$(mktemp "${CLIENT_DIR}/.${name}.conf.XXXXXX")"
+    tmp_server="$(mktemp "${WG_DIR}/.${WG_IF}.conf.XXXXXX")"
+    tmp_backup="$(mktemp "${WG_DIR}/.${WG_IF}.backup.XXXXXX")"
+    cp -p -- "${WG_CONF}" "${tmp_backup}"
+
+    cat > "${tmp_client}" <<EOF
+[Interface]
+PrivateKey = ${client_private}
+Address = ${client_ip}/32
+DNS = ${CLIENT_DNS}
+
+[Peer]
+PublicKey = ${server_public}
+PresharedKey = ${psk}
+Endpoint = ${SERVER_ENDPOINT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+
+    cat "${WG_CONF}" > "${tmp_server}"
+    cat >> "${tmp_server}" <<EOF
+
+# BEGIN_PEER ${name}
+[Peer]
+PublicKey = ${client_public}
+PresharedKey = ${psk}
+AllowedIPs = ${client_ip}/32
+# END_PEER ${name}
+EOF
+    chmod 600 "${tmp_client}" "${tmp_server}" "${tmp_backup}"
+
+    if ! wg set "${WG_IF}" peer "${client_public}" \
+        preshared-key <(printf '%s\n' "${psk}") \
+        allowed-ips "${client_ip}/32"; then
+        wg set "${WG_IF}" peer "${client_public}" remove || true
+        rm -f -- "${tmp_client}" "${tmp_server}" "${tmp_backup}"
+        die "Could not add the live peer; temporary files were removed."
+    fi
+
+    if ! mv -f -- "${tmp_server}" "${WG_CONF}"; then
+        wg set "${WG_IF}" peer "${client_public}" remove || true
+        rm -f -- "${tmp_client}" "${tmp_server}" "${tmp_backup}"
+        die "Could not update ${WG_CONF}; the live peer was rolled back."
+    fi
+    if ! mv -f -- "${tmp_client}" "${client_conf}"; then
+        mv -f -- "${tmp_backup}" "${WG_CONF}" || true
+        wg set "${WG_IF}" peer "${client_public}" remove || true
+        rm -f -- "${tmp_client}" "${tmp_server}" "${tmp_backup}"
+        die "Could not save the client profile; the peer was rolled back."
+    fi
+    rm -f -- "${tmp_backup}"
+
+    printf 'Client created: %s\nVPN address:   %s/32\nProfile:       %s\n\nQR code:\n' "${name}" "${client_ip}" "${client_conf}"
+    command -v qrencode >/dev/null 2>&1 && qrencode -t ansiutf8 < "${client_conf}" || printf 'Install qrencode to display a QR code.\n'
+}
+
+remove_client() {
+    local name="${1:-}" public_key tmp_server
+    valid_name "${name}" || die "Usage: wg-user remove NAME (letters, numbers, underscore, or hyphen only)"
+    [[ -f "${CLIENT_DIR}/${name}.conf" ]] || die "Client not found: ${name}"
+    public_key="$(peer_key_for "${name}")"
+    [[ -n "${public_key}" ]] || die "No matching peer block found for ${name}; profile was left untouched."
+
+    tmp_server="$(mktemp "${WG_DIR}/.${WG_IF}.conf.XXXXXX")"
+    awk -v n="${name}" '
+        $0 == "# BEGIN_PEER " n { skip=1; next }
+        $0 == "# END_PEER " n { skip=0; next }
+        !skip { print }
+    ' "${WG_CONF}" > "${tmp_server}"
+    chmod 600 "${tmp_server}"
+
+    if wg show "${WG_IF}" >/dev/null 2>&1; then
+        wg set "${WG_IF}" peer "${public_key}" remove
+    fi
+    mv -f -- "${tmp_server}" "${WG_CONF}"
+    rm -f -- "${CLIENT_DIR}/${name}.conf"
+    printf 'Client removed: %s\n' "${name}"
+}
+
+# Serialize manager operations so concurrent add/remove commands cannot reuse an address.
+exec 9>"${LOCK_FILE}"
+flock 9
+
+case "${1:-}" in
+    add)    add_client "${2:-}" ;;
+    remove|delete) remove_client "${2:-}" ;;
+    list)   list_clients ;;
+    show)   show_or_qr show "${2:-}" ;;
+    qr)     show_or_qr qr "${2:-}" ;;
+    *)
+        cat <<'EOF'
+WireGuard client manager
+
+Usage:
+  wg-user add NAME
+  wg-user remove NAME
+  wg-user list
+  wg-user show NAME
+  wg-user qr NAME
+EOF
+        [[ -z "${1:-}" ]] || exit 2
+        ;;
+esac
