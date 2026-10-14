@@ -35,6 +35,7 @@ fi
 
 uninstall_wireguard() {
     local firewall port zone field value name rules tmp number scope owned other_tunnel=0 path backup
+    local policy="wg-${WG_IF}-fwd" vpn_zone="wg-${WG_IF}"
     [[ -f "${WG_CONF}" && -f "${WG_ENV}" ]] || die "No installed wg0 configuration and environment file found."
     exec 9>/run/lock/wg-user.lock
     flock 9
@@ -94,19 +95,19 @@ uninstall_wireguard() {
         ufw reload
     else
         # Do not reload: deleting runtime objects preserves unrelated runtime-only rules.
-        if firewall-cmd --get-policies | tr ' ' '\n' | grep -qx "wg-${WG_IF}"; then
-            firewall-cmd --policy="wg-${WG_IF}" --remove-ingress-zone="wg-${WG_IF}"
+        if firewall-cmd --get-policies | tr ' ' '\n' | grep -qx "${policy}"; then
+            firewall-cmd --policy="${policy}" --remove-ingress-zone="${vpn_zone}"
         fi
-        if firewall-cmd --get-zones | tr ' ' '\n' | grep -qx "wg-${WG_IF}"; then
-            if firewall-cmd --zone="wg-${WG_IF}" --query-interface="${WG_IF}" >/dev/null; then
-                firewall-cmd --zone="wg-${WG_IF}" --remove-interface="${WG_IF}"
+        if firewall-cmd --get-zones | tr ' ' '\n' | grep -qx "${vpn_zone}"; then
+            if firewall-cmd --zone="${vpn_zone}" --query-interface="${WG_IF}" >/dev/null; then
+                firewall-cmd --zone="${vpn_zone}" --remove-interface="${WG_IF}"
             fi
         fi
-        if firewall-cmd --permanent --get-policies | tr ' ' '\n' | grep -qx "wg-${WG_IF}"; then
-            firewall-cmd --permanent --delete-policy="wg-${WG_IF}"
+        if firewall-cmd --permanent --get-policies | tr ' ' '\n' | grep -qx "${policy}"; then
+            firewall-cmd --permanent --delete-policy="${policy}"
         fi
-        if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "wg-${WG_IF}"; then
-            firewall-cmd --permanent --delete-zone="wg-${WG_IF}"
+        if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "${vpn_zone}"; then
+            firewall-cmd --permanent --delete-zone="${vpn_zone}"
         fi
         if [[ -n "${zone}" ]]; then
             for scope in runtime permanent; do
@@ -313,7 +314,7 @@ protect_ssh_and_start_firewalld() {
 }
 
 configure_firewall() {
-    local zone policy="wg-${WG_IF}" vpn_zone="wg-${WG_IF}" scope
+    local zone policy="wg-${WG_IF}-fwd" vpn_zone="wg-${WG_IF}" scope
     if [[ "${WG_FIREWALL}" == ufw ]]; then
         local rules=/etc/ufw/before.rules backup
         [[ -f "${rules}" ]] || die "Missing ${rules}."
@@ -351,7 +352,7 @@ configure_firewall() {
         # Dedicated zone/policy: forward only the VPN subnet to the outbound zone.
         if firewall-cmd --permanent --get-zones | tr ' ' '\n' | grep -qx "${vpn_zone}" ||
             firewall-cmd --permanent --get-policies | tr ' ' '\n' | grep -qx "${policy}"; then
-            die "firewalld zone or policy ${vpn_zone} already exists. Review it before installing."
+            die "firewalld zone ${vpn_zone} or policy ${policy} already exists. Review it before installing."
         fi
         firewall-cmd --permanent --new-zone="${vpn_zone}"
         firewall-cmd --permanent --zone="${vpn_zone}" --add-interface="${WG_IF}"

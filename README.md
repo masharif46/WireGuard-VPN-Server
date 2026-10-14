@@ -61,6 +61,14 @@ sudo WG_FIREWALL=firewalld bash setup-wireguard.sh
 
 The installer detects the active firewall when `WG_FIREWALL=auto` is used. If neither firewall is active, prepare UFW as shown above or choose firewalld explicitly.
 
+Run the installer once. After a successful installation, another install run stops because `/etc/wireguard/wg0.conf` already exists. If a firewalld install fails after creating the `wg-wg0` zone but before creating that configuration, remove that partial zone before retrying. Only do this when the zone was created by the failed WireGuard install:
+
+```bash
+sudo firewall-cmd --permanent --delete-zone=wg-wg0
+sudo firewall-cmd --check-config
+sudo WG_FIREWALL=firewalld bash setup-wireguard.sh
+```
+
 ### Rocky Linux 10: firewalld
 
 Rocky uses DNF, not APT. You can install firewalld yourself:
@@ -99,7 +107,63 @@ The installer creates the first client profile here:
 /etc/wireguard/clients/client1.conf
 ```
 
-Import the profile's QR code in the WireGuard app, or securely transfer the configuration file to the client device. Each profile contains a private key, so share it only with its intended user.
+Install the WireGuard app on the device, then import its profile from a QR code or a configuration file. The installer displays the initial `client1` profile as a QR code when setup finishes. Create a separate profile for every additional device; do not copy one profile to multiple devices. For example, create profiles for a phone and a laptop with:
+
+```bash
+sudo wg-user add alice-phone
+sudo wg-user add alice-laptop
+```
+
+Each command prints a QR code. On a phone or tablet, open the WireGuard app, add a tunnel by scanning the QR code shown in the server terminal, and give the tunnel a recognizable name. For a computer, use `sudo wg-user show alice-laptop` to display the profile, then securely transfer its contents to that device and import the configuration file in the WireGuard app. Keep the file private and delete temporary copies after importing it.
+
+Profiles are device-specific and each contains a private key. Anyone with a profile can connect as that device, so only share it with its intended user. If a device is lost or its profile is exposed, revoke that profile with `sudo wg-user remove NAME` and create a replacement for the device.
+
+Client profiles route IPv4 traffic through the VPN by default (`AllowedIPs = 0.0.0.0/0`). The server setup does not configure IPv6 routing.
+
+### Linux client
+
+Install the WireGuard tools package for your distribution, then create a dedicated profile on the server:
+
+```bash
+sudo wg-user add linux-laptop
+```
+
+Copy `/etc/wireguard/clients/linux-laptop.conf` securely to the Linux device. On that device, save it as `/etc/wireguard/wg-client.conf`, restrict access to the private key, and start it at boot:
+
+```bash
+sudo install -m 600 linux-laptop.conf /etc/wireguard/wg-client.conf
+sudo systemctl enable --now wg-quick@wg-client
+sudo wg show wg-client
+```
+
+Stop and disable the tunnel with `sudo systemctl disable --now wg-quick@wg-client`. For a temporary session instead, run `sudo wg-quick up ./linux-laptop.conf` and later `sudo wg-quick down ./linux-laptop.conf`. `wg-quick` uses the profile's `AllowedIPs = 0.0.0.0/0` to route IPv4 traffic through the VPN. See the [WireGuard installation guide](https://www.wireguard.com/install/) for distribution-specific packages and the [quick start](https://www.wireguard.com/quickstart/) for Linux command details.
+
+### MikroTik RouterOS client
+
+Use RouterOS 7 with a separate profile generated on the WireGuard server:
+
+```bash
+sudo wg-user add mikrotik-home
+sudo wg-user show mikrotik-home
+```
+
+RouterOS needs the profile values entered into its own interface and peer settings. In WinBox or the RouterOS terminal, create an interface and peer using the values from `mikrotik-home`'s profile:
+
+```routeros
+/interface wireguard add name=wg-vpn listen-port=13231 private-key="CLIENT_PRIVATE_KEY"
+/ip address add address=CLIENT_ADDRESS interface=wg-vpn
+/interface wireguard peers add interface=wg-vpn public-key="SERVER_PUBLIC_KEY" preshared-key="CLIENT_PRESHARED_KEY" endpoint-address=SERVER_HOST endpoint-port=51820 allowed-address=0.0.0.0/0 persistent-keepalive=25s
+```
+
+Replace the placeholders with the corresponding profile values: `CLIENT_PRIVATE_KEY` is `[Interface] PrivateKey`, `CLIENT_ADDRESS` is `[Interface] Address` (for example, `10.8.0.3/32`), and the peer key and endpoint values come from `[Peer]`. Split `[Peer] Endpoint` into its hostname or IP and port. Change `51820` if the profile uses a custom port, and choose a listen port that is not already in use on the router.
+
+To route traffic to the VPN subnet through the tunnel, add:
+
+```routeros
+/ip route add dst-address=10.8.0.0/24 gateway=wg-vpn
+```
+
+This creates the WireGuard tunnel and a route to the VPN subnet. It does not send the router's default internet traffic or devices on the MikroTik LAN through the VPN. Full-tunnel routing on RouterOS needs routes that preserve the server endpoint's path through the normal WAN, plus appropriate forwarding and NAT for LAN clients. This server assigns each peer only its own `10.8.0.x/32` address; LAN traffic sent through the tunnel must be translated to that address, or the server's peer and firewall configuration must be extended. Configure RouterOS DNS separately if you want the router or its LAN clients to use a specific DNS server. See [MikroTik's RouterOS WireGuard documentation](https://help.mikrotik.com/docs/spaces/ROS/pages/69664792/WireGuard) for RouterOS peer, routing, and firewall settings.
 
 ## Manage clients
 
@@ -114,6 +178,22 @@ sudo wg-user remove alice
 ```
 
 `add` creates a profile and displays its QR code. `show` prints the full profile, including its private key. `remove` revokes the client's key on the running server and deletes its saved profile.
+
+To inspect peer activity, run:
+
+```bash
+sudo wg show wg0
+```
+
+For each peer, check `latest handshake`, `transfer`, and `allowed ips`. WireGuard has no persistent connected/disconnected status: a recent handshake and increasing transfer counters indicate recent activity. `sudo wg-user list` shows every configured client profile, including clients that are currently offline; match its VPN address to a peer's `allowed ips` in `wg show`.
+
+To disconnect and revoke one client, remove its profile by name:
+
+```bash
+sudo wg-user remove alice
+```
+
+The client loses access immediately and its saved profile is deleted. Remove a client from its device as well, so it does not keep trying to connect. To stop VPN access for everyone temporarily, stop the server interface with `sudo systemctl stop wg-quick@wg0`; restore service with `sudo systemctl start wg-quick@wg0`. Clients with valid profiles can reconnect when service returns.
 
 WireGuard clients authenticate with cryptographic keys, not account passwords. To rotate a client's credentials, revoke its old key and create a replacement profile:
 
