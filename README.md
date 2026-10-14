@@ -138,6 +138,18 @@ sudo wg show wg-client
 
 Stop and disable the tunnel with `sudo systemctl disable --now wg-quick@wg-client`. For a temporary session instead, run `sudo wg-quick up ./linux-laptop.conf` and later `sudo wg-quick down ./linux-laptop.conf`. `wg-quick` uses the profile's `AllowedIPs = 0.0.0.0/0` to route IPv4 traffic through the VPN. See the [WireGuard installation guide](https://www.wireguard.com/install/) for distribution-specific packages and the [quick start](https://www.wireguard.com/quickstart/) for Linux command details.
 
+### Windows client
+
+Create a profile just for the Windows computer on the server:
+
+```bash
+sudo wg-user add windows-laptop
+```
+
+Install the official [WireGuard for Windows client](https://www.wireguard.com/install/), then securely transfer `/etc/wireguard/clients/windows-laptop.conf` from the server to the computer. In WireGuard for Windows, choose **Add Tunnel** → **Import tunnel(s) from file**, select the `.conf` file, then choose **Activate**. Approve the administrator prompt if Windows displays one. The tunnel status and transfer counters appear in the app; on the server, `sudo wg show wg0` shows the peer's latest handshake and traffic.
+
+Choose **Deactivate** in the Windows app to disconnect. Keep the configuration file private because it contains the client's private key. If the computer is lost or the profile is exposed, revoke it on the server with `sudo wg-user remove windows-laptop`.
+
 ### MikroTik RouterOS client
 
 Use RouterOS 7 with a separate profile generated on the WireGuard server:
